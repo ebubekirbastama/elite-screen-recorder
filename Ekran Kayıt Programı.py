@@ -16,8 +16,8 @@ Modern, hafif ve çapraz platform (Windows / Linux / macOS) ekran kayıt uygulam
 Gereksinimler (requirements.txt içinde de var):
     pip install customtkinter pillow sounddevice
 
-Ayrıca sisteminizde FFmpeg kurulu ve PATH'e ekli olmalı:
-    Windows : https://www.gyan.dev/ffmpeg/builds/  (zip indirip PATH'e ekleyin)
+Windows icin FFmpeg sadece C:\\ffmpeg.exe konumuna yerlestirilmelidir:
+    Windows : https://www.gyan.dev/ffmpeg/builds/  (ffmpeg.exe dosyasini C:\\ffmpeg.exe konumuna koyun)
     macOS   : brew install ffmpeg
     Linux   : sudo apt install ffmpeg   (veya dağıtımınıza uygun paket yöneticisi)
 """
@@ -30,6 +30,7 @@ import platform
 import subprocess
 import threading
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -70,21 +71,27 @@ def _hidden_kwargs_early():
 
 
 def _pip_install(package: str) -> bool:
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", package],
-            **_hidden_kwargs_early(),
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    """Eksik bağımlılığı etkin Python yorumlayıcısına yükler."""
+    commands = [
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", package],
+        [sys.executable, "-m", "pip", "install", "--user", "--disable-pip-version-check", package],
+    ]
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=180, **_hidden_kwargs_early()
+            )
+            if result.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return False
 
 
 def ensure_python_packages():
-    """Eksik Python paketlerini otomatik olarak kurar. Konsolsuz (.exe) modda da
-    çalışsın diye herhangi bir kullanıcı girdisi beklemez."""
+    """Başlangıçta eksik paketleri otomatik kurar (internet gerekebilir)."""
     import importlib
-
     missing = []
     for module_name, pip_name in REQUIRED_PACKAGES.items():
         try:
@@ -95,13 +102,26 @@ def ensure_python_packages():
     if not missing:
         return
 
-    print(f"Eksik paketler tespit edildi, kuruluyor: {', '.join(missing)}")
-    for pip_name in missing:
-        _pip_install(pip_name)
+    # Basit bir Windows bildirim penceresi: Tk/CustomTkinter paketleri henüz eksik olabilir.
+    try:
+        from tkinter import Tk, messagebox
+        root = Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "Elite Screen Recorder - İlk Kurulum",
+            "Eksik Python paketleri otomatik yüklenecek:\n" +
+            ", ".join(missing) + "\n\nİnternet bağlantısı gerekebilir.",
+            parent=root,
+        )
+        root.destroy()
+    except Exception:
+        print("Eksik paketler kuruluyor:", ", ".join(missing))
 
-    # Kurulumdan sonra tekrar dene; hâlâ eksikse kullanıcıyı bilgilendir ve çık
-    still_missing = []
+    for package in missing:
+        _pip_install(package)
+
     importlib.invalidate_caches()
+    still_missing = []
     for module_name, pip_name in REQUIRED_PACKAGES.items():
         try:
             importlib.import_module(module_name)
@@ -110,90 +130,35 @@ def ensure_python_packages():
 
     if still_missing:
         msg = (
-            "Aşağıdaki paketler otomatik kurulamadı, lütfen elle kurun:\n\n"
-            f"pip install {' '.join(still_missing)}"
+            "Otomatik paket kurulumu başarısız oldu.\n"
+            "İnternet erişimini, Python/pip kurulumunu ve kullanıcı izinlerini kontrol edin.\n\n"
+            "Eksik: " + ", ".join(still_missing) + "\n\n"
+            "İsterseniz elle çalıştırın:\npython -m pip install " + " ".join(still_missing)
         )
         try:
-            import tkinter
-            from tkinter import messagebox
-            root = tkinter.Tk()
+            from tkinter import Tk, messagebox
+            root = Tk()
             root.withdraw()
-            messagebox.showerror("Elite Screen Recorder - Kurulum", msg)
+            messagebox.showerror("Elite Screen Recorder - Paket Hatası", msg, parent=root)
+            root.destroy()
         except Exception:
             print(msg)
         sys.exit(1)
 
 
-FFMPEG_PATH = r"C:\\ffmpeg.exe"
+# Windows sürümünde FFmpeg yalnızca bu tam dosya yolunda aranır.
+FFMPEG_PATH = r"C:\ffmpeg.exe"
 
 
 def find_ffmpeg() -> str | None:
-    """Önce C:\\ffmpeg.exe yolunu, sonra sistem PATH'ini kontrol eder."""
-    if os.path.isfile(FFMPEG_PATH):
-        return FFMPEG_PATH
+    """Windows'ta PATH'i veya program klasörünü taramadan tek sabit konumu kontrol eder."""
+    if SYSTEM_EARLY == "Windows":
+        return FFMPEG_PATH if Path(FFMPEG_PATH).is_file() else None
+    # Diğer işletim sistemleri için sistemdeki FFmpeg'i kullan.
     return shutil.which("ffmpeg")
 
 
-def _try_install_ffmpeg() -> bool:
-    """İşletim sistemine göre FFmpeg'i otomatik kurmayı dener.
-    Windows: winget (Win10 2004+ / Win11'de hazır gelir)
-    macOS: Homebrew (kuruluysa)
-    Linux: apt (Debian/Ubuntu tabanlı dağıtımlarda)
-    Hiçbiri uygun değilse False döner ve kullanıcıya elle kurulum önerilir."""
-    try:
-        if SYSTEM_EARLY == "Windows" and shutil.which("winget"):
-            subprocess.run(
-                ["winget", "install", "--id", "Gyan.FFmpeg", "-e",
-                 "--accept-package-agreements", "--accept-source-agreements"],
-                **_hidden_kwargs_early(),
-            )
-            return shutil.which("ffmpeg") is not None
-
-        elif SYSTEM_EARLY == "Darwin" and shutil.which("brew"):
-            subprocess.run(["brew", "install", "ffmpeg"])
-            return shutil.which("ffmpeg") is not None
-
-        elif SYSTEM_EARLY == "Linux" and shutil.which("apt"):
-            subprocess.run(["sudo", "apt", "install", "-y", "ffmpeg"])
-            return shutil.which("ffmpeg") is not None
-
-    except Exception:
-        pass
-    return False
-
-
-def ensure_ffmpeg():
-    """FFmpeg kurulu değilse otomatik kurmayı dener; olmazsa kullanıcıyı
-    indirme sayfasına yönlendiren bir uyarı gösterir (uygulamayı kapatmaz,
-    kayıt başlatılınca zaten tekrar uyarılır)."""
-    if find_ffmpeg():
-        return
-
-    print("FFmpeg bulunamadı, otomatik kurulum deneniyor...")
-    installed = _try_install_ffmpeg()
-
-    if not installed:
-        msg = (
-            "FFmpeg otomatik kurulamadı.\n\n"
-            "Lütfen elle kurun:\n"
-            "  Windows : winget install Gyan.FFmpeg  (veya gyan.dev'den indirin)\n"
-            "  macOS   : brew install ffmpeg\n"
-            "  Linux   : sudo apt install ffmpeg\n\n"
-            "Kurduktan sonra programı yeniden başlatın."
-        )
-        try:
-            import tkinter
-            from tkinter import messagebox
-            root = tkinter.Tk()
-            root.withdraw()
-            messagebox.showwarning("Elite Screen Recorder - FFmpeg", msg)
-            root.destroy()
-        except Exception:
-            print(msg)
-
-
 ensure_python_packages()
-ensure_ffmpeg()
 
 import customtkinter as ctk
 from tkinter import messagebox
@@ -308,30 +273,6 @@ def list_windows():
     return unique
 
 
-def ensure_admin_on_windows():
-    """Windows'ta program yönetici (admin) yetkisiyle çalışmıyorsa,
-    UAC onayı isteyip kendini yönetici olarak yeniden başlatır."""
-    if SYSTEM != "Windows":
-        return
-    try:
-        import ctypes
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        is_admin = False
-
-    if not is_admin:
-        import ctypes
-        script = os.path.abspath(sys.argv[0])
-        params = " ".join([f'"{a}"' for a in sys.argv[1:]])
-        try:
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, f'"{script}" {params}', None, 1
-            )
-        except Exception:
-            pass
-        sys.exit(0)
-
-
 def _windows_videos_folder() -> Path | None:
     """Windows'ta gerçek 'Videos' klasör yolunu Registry/Shell API üzerinden bulur.
     Bazı sistemlerde bu klasör OneDrive'a veya farklı bir sürücüye taşınmış olabilir,
@@ -344,9 +285,11 @@ def _windows_videos_folder() -> Path | None:
         SHGFP_TYPE_CURRENT = 0
 
         buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
-        ctypes.windll.shell32.SHGetFolderPathW(0, CSIDL_MYVIDEO, 0, SHGFP_TYPE_CURRENT, buf)
+        result = ctypes.windll.shell32.SHGetFolderPathW(0, CSIDL_MYVIDEO, 0, SHGFP_TYPE_CURRENT, buf)
+        if result != 0 or not buf.value.strip():
+            return None
         path = Path(buf.value)
-        if path and str(path):
+        if path.is_dir():
             return path
     except Exception:
         pass
@@ -354,39 +297,56 @@ def _windows_videos_folder() -> Path | None:
 
 
 def get_output_dir() -> Path:
-    """Çıktı klasörünü bulur/oluşturur. Birden çok aday yol dener; hiçbiri
-    çalışmazsa kullanıcı klasörü altına (her zaman var olan bir konuma) düşer,
-    böylece uygulama asla klasör bulunamadığı için çökmez."""
+    """Kayit icin gercekten yazilabilir bir klasor bulur.
+
+    Var olan ama yanlis yonlendirilmis/erisim engelli Windows Videos klasorlerini
+    kullanmaz. Her adayi dosya olusturarak test eder.
+    """
     home = Path.home()
     candidates = []
-
     if SYSTEM == "Windows":
-        win_videos = _windows_videos_folder()
-        if win_videos:
-            candidates.append(win_videos)
-        candidates.append(home / "Videos")
-        candidates.append(Path(os.environ.get("USERPROFILE", str(home))) / "Videos")
+        videos = _windows_videos_folder()
+        if videos:
+            candidates.append(videos)
+        candidates.extend((home / "Videos", home / "Documents"))
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(Path(local))
     elif SYSTEM == "Darwin":
         candidates.append(home / "Movies")
     else:
         candidates.append(home / "Videos")
+    candidates.extend((home, Path(tempfile.gettempdir())))
 
-    # Her ihtimale karşı son çare: kullanıcı klasörünün doğrudan altı
-    candidates.append(home)
-
-    last_error = None
-    for base in candidates:
+    failures = []
+    for base in dict.fromkeys(candidates):
+        output = Path(base) / "EliteScreenRecorder" / "Kayitlar"
         try:
-            out_dir = Path(base) / "EliteScreenRecorder" / "Kayitlar"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            return out_dir
-        except Exception as e:
-            last_error = e
+            output.mkdir(parents=True, exist_ok=True)
+            # mkdir basarili olsa bile yeni dosya olusturulamayabilir.
+            with tempfile.NamedTemporaryFile(prefix=".write_test_", dir=output, delete=True) as probe:
+                probe.write(b"ok")
+                probe.flush()
+            return output
+        except (OSError, ValueError) as exc:
+            failures.append(f"{output}: {exc}")
+    raise RuntimeError("Kayit icin yazilabilir klasor bulunamadi.\n" + "\n".join(failures[-4:]))
+
+
+def get_log_file() -> Path | None:
+    """Logu video klasorunden bagimsiz, yazilabilir bir alanda tut."""
+    bases = []
+    if SYSTEM == "Windows" and os.environ.get("LOCALAPPDATA"):
+        bases.append(Path(os.environ["LOCALAPPDATA"]))
+    bases.append(Path(tempfile.gettempdir()))
+    for base in bases:
+        try:
+            folder = base / "EliteScreenRecorder" / "Logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder / "ffmpeg_error.log"
+        except OSError:
             continue
-
-    # Buraya hiç düşmemeli, ama garanti olsun diye:
-    raise RuntimeError(f"Çıktı klasörü hiçbir konumda oluşturulamadı: {last_error}")
-
+    return None
 
 
 def hidden_subprocess_kwargs():
@@ -401,84 +361,142 @@ def hidden_subprocess_kwargs():
     return kwargs
 
 
-def list_microphones():
-    """Mikrofonları kayıt motoruyla aynı kaynaktan listeler.
+# Liste hem PortAudio/sounddevice hem de FFmpeg DirectShow kaynaklarından oluşur.
+# Mikrofon menüsünde sadece gerçek kayıt cihazları gösterilir.
+# Etiket ile FFmpeg aygıt adı birbirinden AYRIDIR; FFmpeg'e kesinlikle
+# sounddevice'in kısaltılmış adı ya da "Alternative name" aktarılmaz.
+DSHOW_AUDIO_DEVICES = {}
+MIC_DIAGNOSTIC = ""
 
-    Windows'ta doğrudan FFmpeg DirectShow (dshow) cihaz adları kullanılır.
-    Böylece sounddevice ile FFmpeg arasındaki cihaz adı uyuşmazlığı önlenir.
+
+def parse_dshow_audio_devices(output: str):
+    """FFmpeg dshow çıktısını sürümden bağımsız ayrıştırır.
+
+    FFmpeg iki biçim üretebilir:
+      [dshow @ ...] DirectShow audio devices
+      [dshow @ ...]  "Mikrofon (...)"
+    veya (bazı sürümlerde bölüm başlığı olmadan):
+      [dshow @ ...] "Mikrofon (...)" (audio)
+
+    NOT: -list_devices komutu normal olarak hata koduyla biter; bu başarısızlık değildir.
     """
-    devices = ["Yok"]
+    devices = []
+    section = None
+    for line in output.splitlines():
+        low = line.casefold()
+        if "directshow audio devices" in low:
+            section = "audio"
+            continue
+        if "directshow video devices" in low:
+            section = "video"
+            continue
+        if "alternative name" in low:
+            continue
+        match = re.search(r'"([^"\r\n]+)"', line)
+        if not match:
+            continue
+        raw_name = match.group(1).strip()
+        # Bazı FFmpeg derlemelerinde audio etiketi satırın SONUNDADIR.
+        suffix = line[match.end():].casefold()
+        is_audio = bool(re.search(r'\(audio\)', suffix))
+        is_video = bool(re.search(r'\(video\)', suffix))
+        if is_video or (not is_audio and section != "audio"):
+            continue
+        if raw_name.startswith('@device_') or not raw_name:
+            continue
+        if raw_name.casefold() not in {item.casefold() for item in devices}:
+            devices.append(raw_name)
+    return devices
 
-    if SYSTEM == "Windows":
-        ffmpeg = find_ffmpeg()
-        if ffmpeg:
+
+def _query_directshow_microphones():
+    """FFmpeg listesinden gerçek aygıt adını döndürür; exit=1 normaldir."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return [], "FFmpeg dosyası bulunamadı: C:\\ffmpeg.exe"
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, **hidden_subprocess_kwargs(),
+        )
+        raw = (result.stderr or b"") + b"\n" + (result.stdout or b"")
+        # stderr yerel kod sayfasında da gelebilir: ASCII karakterleri üzerinden
+        # ayrıştırma yapılır, sonra gerçek cihaz adı bozulmadan çözümlenir.
+        import locale
+        encodings = list(dict.fromkeys(["utf-8", "cp1254", locale.getpreferredencoding(False), "cp1252"]))
+        decoded = []
+        for enc in encodings:
             try:
-                result = subprocess.run(
-                    [
-                        ffmpeg,
-                        "-hide_banner",
-                        "-list_devices", "true",
-                        "-f", "dshow",
-                        "-i", "dummy",
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=8,
-                    **hidden_subprocess_kwargs(),
-                )
-
-                output = result.stderr or ""
-                in_audio_section = False
-
-                for line in output.splitlines():
-                    low = line.lower()
-
-                    if "directshow audio devices" in low:
-                        in_audio_section = True
-                        continue
-
-                    if "directshow video devices" in low:
-                        in_audio_section = False
-                        continue
-
-                    if not in_audio_section:
-                        continue
-
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        name = match.group(1).strip()
-
-                        # FFmpeg bazı cihazlar için ayrıca alternatif @device_...
-                        # satırı yazar; kullanıcıya sadece okunabilir gerçek adı göster.
-                        if (
-                            name
-                            and not name.startswith("@device_")
-                            and name not in devices
-                        ):
-                            devices.append(name)
-
-                if len(devices) > 1:
-                    return devices
-
-            except Exception:
+                decoded.append(raw.decode(enc))
+            except (UnicodeError, LookupError):
                 pass
+        if not decoded:
+            decoded = [raw.decode("utf-8", errors="replace")]
+        best_names, best_output = [], decoded[0]
+        for output in decoded:
+            names = parse_dshow_audio_devices(output)
+            if len(names) > len(best_names):
+                best_names, best_output = names, output
+        return best_names, best_output[-3000:]
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return [], str(exc)
 
-    # Windows dışında veya FFmpeg listeleme başarısızsa yedek yöntem.
+def _mic_label(raw):
+    """Sadece arayüz için okunur ad; kayıtta raw isim kullanılır."""
+    name = raw.strip()
+    m = re.match(r"^(?:mikrofon|microphone)\s*\((.*)\)$", name, flags=re.I)
+    if m:
+        name = m.group(1).strip()
+        name = re.sub(r"^\d+\s*-\s*", "", name)
+        return f"{name} — Mikrofon"
+    return name
+
+
+def list_microphones():
+    """Mükerrer / kısaltılmış PortAudio aygıtları yerine gerçek FFmpeg girişleri."""
+    global DSHOW_AUDIO_DEVICES, MIC_DIAGNOSTIC
+    DSHOW_AUDIO_DEVICES = {}
+    labels = ["Yok (Sessiz kayıt)"]
+    if SYSTEM == "Windows":
+        names, MIC_DIAGNOSTIC = _query_directshow_microphones()
+        # Stereo Mix gibi loopback aygıtları mikrofon menüsünde yer almasın.
+        microphone_names = [n for n in names if not any(
+            term in n.casefold() for term in
+            ("stereo mix", "stereo kar", "what u hear", "wave out mix")
+        )]
+        for raw in microphone_names:
+            label = _mic_label(raw)
+            if label in DSHOW_AUDIO_DEVICES:
+                label = raw  # Etiket çakışıyorsa ham ismi göster
+            DSHOW_AUDIO_DEVICES[label] = raw
+            labels.append(label)
+        return labels
+
+    # Diğer işletim sistemlerinde önceki yöntemi kullan.
     if HAS_SOUNDDEVICE:
         try:
             for d in sd.query_devices():
                 if d.get("max_input_channels", 0) > 0:
                     name = str(d["name"]).strip()
-                    if name and name not in devices:
-                        devices.append(name)
-        except Exception:
-            pass
+                    if name and name not in labels:
+                        labels.append(name)
+        except Exception as exc:
+            MIC_DIAGNOSTIC = str(exc)
+    return labels
 
-    return devices
 
+def resolve_microphone(label):
+    if label in ("Yok", "Yok (Sessiz kayıt)"):
+        return None
+    if SYSTEM == "Windows":
+        raw_name = DSHOW_AUDIO_DEVICES.get(label)
+        if raw_name is None:
+            raise RuntimeError(
+                "Mikrofon listesi değişmiş. 'Mikrofonları Yenile' düğmesine basın ve cihazı yeniden seçin."
+            )
+        return raw_name
+    return label
 
 # --------------------------------------------------------------------------- #
 #  Kayıt motoru (FFmpeg ile) - düşük sistem yükü için native encoder katmanı
@@ -546,12 +564,12 @@ class Recorder:
 
         # ------- Ses girişleri -------
         audio_inputs = 0
-        if mic_device and mic_device != "Yok":
+        if mic_device and mic_device not in ("Yok", "Yok (Sessiz kayıt)"):
             if SYSTEM == "Windows":
                 cmd += [
                     "-thread_queue_size", "1024",
                     "-f", "dshow",
-                    "-i", f"audio={mic_device}"
+                    "-i", f"audio={resolve_microphone(mic_device)}"
                 ]
             elif SYSTEM == "Darwin":
                 cmd += ["-f", "avfoundation", "-i", f":{mic_device}"]
@@ -561,11 +579,18 @@ class Recorder:
 
         if system_audio:
             if SYSTEM == "Windows":
-                # "Stereo Mix" cihazı etkinse sistem sesini de dshow üzerinden alır
-                cmd += ["-f", "dshow", "-i", "audio=Stereo Mix"]
+                # Windows'un yerelleştirilmiş Stereo Mix ismini de destekle.
+                system_names, _ = _query_directshow_microphones()
+                stereo = next((n for n in system_names if any(k in n.casefold() for k in
+                               ("stereo mix", "stereo kar", "what u hear", "wave out mix"))), None)
+                if not stereo:
+                    raise RuntimeError("Sistem sesi için Stereo Mix aygıtı etkin değil. Windows Ses ayarlarından etkinleştirin veya bu seçeneği kapatın.")
+                cmd += ["-f", "dshow", "-i", "audio=" + stereo]
             elif SYSTEM == "Linux":
                 cmd += ["-f", "pulse", "-i", "default"]
-            # macOS için sistem sesi genelde ek sanal cihaz (BlackHole vb.) gerektirir
+            # macOS için sistem sesi sanal ses aygıtı gerektirir.
+            if SYSTEM == "Darwin":
+                raise RuntimeError("macOS sistem sesi için BlackHole benzeri bir sanal ses aygıtı gerekir.")
             audio_inputs += 1
 
         # ------- Video filtreleri / ölçekleme -------
@@ -590,36 +615,50 @@ class Recorder:
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError(
-                "FFmpeg bulunamadı. Lütfen FFmpeg'i kurun ve PATH'e ekleyin."
+                f"FFmpeg bulunamadı. Dosyayı {FFMPEG_PATH} konumuna ekleyin."
             )
 
         out_dir = get_output_dir()
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.output_file = out_dir / f"Kayit_{timestamp}.mp4"
+        cmd = self.build_command(width, height, fps, mic_device, system_audio,
+                                 self.output_file, source_mode, monitor_info, window_title)
 
-        cmd = self.build_command(width, height, fps, mic_device, system_audio, self.output_file, source_mode, monitor_info, window_title)
-
-        self.log_file = out_dir / "ffmpeg_error.log"
-        self._log_handle = open(self.log_file, "w", encoding="utf-8", errors="replace")
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=self._log_handle,
-            **hidden_subprocess_kwargs(),
-        )
+        # Gunluk yazilamadigi icin kaydi durdurma; Windows izin/OneDrive
+        # problemlerinde son care DEVNULL kullan.
+        self.log_file = get_log_file()
+        self._log_handle = None
+        if self.log_file is not None:
+            try:
+                self._log_handle = self.log_file.open("w", encoding="utf-8", errors="replace")
+            except OSError:
+                self.log_file = None
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_handle if self._log_handle is not None else subprocess.DEVNULL,
+                **hidden_subprocess_kwargs(),
+            )
+        except OSError as exc:
+            if self._log_handle:
+                self._log_handle.close()
+                self._log_handle = None
+            raise RuntimeError(f"FFmpeg baslatilamadi: {exc}\nDosya: {FFMPEG_PATH}") from exc
 
         # FFmpeg ilk anda hata verip kapanmış mı kontrol et.
         time.sleep(1.0)
         if self.process.poll() is not None:
             try:
-                self._log_handle.flush()
-                self._log_handle.close()
+                if self._log_handle:
+                    self._log_handle.flush()
+                    self._log_handle.close()
+                    self._log_handle = None
             except Exception:
                 pass
             try:
-                error_text = self.log_file.read_text(encoding="utf-8", errors="replace").strip()
+                error_text = self.log_file.read_text(encoding="utf-8", errors="replace").strip() if self.log_file else ""
             except Exception:
                 error_text = ""
 
@@ -683,7 +722,10 @@ class ElitScreenRecorderApp(ctk.CTk):
         self.timer_job = None
 
         self._build_ui()
-        self._check_ffmpeg_banner()
+        self._ffmpeg_was_missing = False
+        self._ffmpeg_missing_alert_shown = False
+        self._check_ffmpeg_banner(initial=True)
+        self.after(3000, self._watch_ffmpeg)
 
     # ---------------------------------------------------------------- UI ---
     def _build_ui(self):
@@ -793,7 +835,7 @@ class ElitScreenRecorderApp(ctk.CTk):
         ctk.CTkLabel(card, text="Mikrofon", font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=9, column=0, sticky="w", **pad
         )
-        self.mic_var = ctk.StringVar(value="Yok")
+        self.mic_var = ctk.StringVar(value="Yok (Sessiz kayıt)")
         self.mic_menu = ctk.CTkOptionMenu(
             card, values=list_microphones(), variable=self.mic_var,
             fg_color="#232331", button_color=ACCENT, button_hover_color=ACCENT_HOVER,
@@ -819,6 +861,21 @@ class ElitScreenRecorderApp(ctk.CTk):
             font=ctk.CTkFont(size=12)
         )
         self.sysaudio_check.grid(row=12, column=0, sticky="w", padx=20, pady=(16, 4))
+
+        # FFmpeg durumu ve kullanıcı tarafından yeniden kontrol
+        self.ffmpeg_frame = ctk.CTkFrame(card, fg_color="transparent")
+        self.ffmpeg_frame.grid(row=14, column=0, sticky="ew", padx=20, pady=(8, 4))
+        self.ffmpeg_frame.grid_columnconfigure(0, weight=1)
+        self.ffmpeg_label = ctk.CTkLabel(
+            self.ffmpeg_frame, text="FFmpeg kontrol ediliyor...", wraplength=320,
+            font=ctk.CTkFont(size=12), anchor="w", justify="left"
+        )
+        self.ffmpeg_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.ffmpeg_check_btn = ctk.CTkButton(
+            self.ffmpeg_frame, text="↻ Tekrar Kontrol Et", width=150, height=32,
+            fg_color="#232331", hover_color="#2E2E40", command=self._manual_ffmpeg_check
+        )
+        self.ffmpeg_check_btn.grid(row=0, column=1)
 
         # Çıktı klasörü
         out_frame = ctk.CTkFrame(card, fg_color="transparent")
@@ -867,12 +924,57 @@ class ElitScreenRecorderApp(ctk.CTk):
         )
         self.record_btn.grid(row=3, column=0, sticky="ew", padx=24, pady=(14, 24))
 
-    def _check_ffmpeg_banner(self):
-        if not find_ffmpeg():
-            self.status_label.configure(
-                text="⚠ FFmpeg bulunamadı — lütfen kurun ve PATH'e ekleyin",
-                text_color=ACCENT_DANGER
+    def _check_ffmpeg_banner(self, initial=False):
+        found = find_ffmpeg() is not None
+        if found:
+            self.ffmpeg_label.configure(
+                text=f"✓ FFmpeg hazır: {find_ffmpeg()}", text_color="#4CD97B"
             )
+            if self._ffmpeg_was_missing:
+                self._refresh_microphones()
+                self.status_label.configure(
+                    text="✓ FFmpeg eklendi, devam edebilirsiniz.", text_color="#4CD97B"
+                )
+                messagebox.showinfo(
+                    APP_NAME, "FFmpeg başarıyla algılandı!\n\n"
+                    f"Konum: {find_ffmpeg()}\n\nProgramı yeniden başlatmadan kayıt yapabilirsiniz."
+                )
+            self._ffmpeg_was_missing = False
+        else:
+            self._ffmpeg_was_missing = True
+            self.ffmpeg_label.configure(
+                text=f"⚠ FFmpeg bulunamadı: {FFMPEG_PATH}", text_color=ACCENT_DANGER
+            )
+            if not self.is_recording:
+                self.status_label.configure(
+                    text="⚠ FFmpeg eksik — C:\\ffmpeg.exe dosyasını ekleyin",
+                    text_color=ACCENT_DANGER
+                )
+            if initial and not self._ffmpeg_missing_alert_shown:
+                self._ffmpeg_missing_alert_shown = True
+                self.after(200, lambda: messagebox.showwarning(
+                    APP_NAME,
+                    "FFmpeg bulunamadı!\n\n"
+                    f"ffmpeg.exe dosyasını tam olarak şu konuma koyun:\n{FFMPEG_PATH}\n\n"
+                    "Dosyayı ekledikten sonra 'Tekrar Kontrol Et' düğmesine basabilirsiniz. "
+                    "Program ayrıca otomatik olarak kontrol eder."
+                ))
+        return found
+
+    def _manual_ffmpeg_check(self):
+        previously_missing = self._ffmpeg_was_missing
+        if self._check_ffmpeg_banner():
+            if not previously_missing:
+                messagebox.showinfo(APP_NAME, "FFmpeg hazır. Kayıt yapmaya devam edebilirsiniz.")
+        else:
+            messagebox.showwarning(
+                APP_NAME, f"FFmpeg hâlâ bulunamadı.\n\nBeklenen dosya: {FFMPEG_PATH}"
+            )
+
+    def _watch_ffmpeg(self):
+        # Kullanıcı ffmpeg.exe'yi çalışırken eklerse otomatik algıla.
+        self._check_ffmpeg_banner()
+        self.after(3000, self._watch_ffmpeg)
 
     # ------------------------------------------------------------ Actions ---
     def _refresh_microphones(self):
@@ -881,7 +983,9 @@ class ElitScreenRecorderApp(ctk.CTk):
 
         current = self.mic_var.get()
         if current not in microphones:
-            self.mic_var.set(microphones[0] if microphones else "Yok")
+            self.mic_var.set(microphones[0])
+        if len(microphones) == 1 and SYSTEM == "Windows" and find_ffmpeg():
+            messagebox.showwarning(APP_NAME, "FFmpeg herhangi bir mikrofon algılamadı.\n\n" + MIC_DIAGNOSTIC[-900:])
 
     def _on_source_changed(self, value):
         if value == "Pencere":
@@ -930,7 +1034,7 @@ class ElitScreenRecorderApp(ctk.CTk):
         if not find_ffmpeg():
             messagebox.showerror(
                 APP_NAME,
-                "FFmpeg bulunamadı. Lütfen FFmpeg'i kurup PATH'e ekleyin, sonra tekrar deneyin."
+                f"FFmpeg bulunamadı. {FFMPEG_PATH} dosyasını ekleyin, ardından Tekrar Kontrol Et'e basın."
             )
             return
 
@@ -947,6 +1051,7 @@ class ElitScreenRecorderApp(ctk.CTk):
             messagebox.showerror(APP_NAME, "Lütfen kaydedilecek pencereyi seçin.")
             return
 
+        self.record_btn.configure(state="disabled")
         def worker():
             try:
                 out_file = self.recorder.start(
@@ -956,14 +1061,37 @@ class ElitScreenRecorderApp(ctk.CTk):
                 self.is_recording = True
                 self.after(0, self._on_record_started, out_file)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(APP_NAME, str(e)))
+                detail = str(e)
+                self.after(0, lambda message=detail: self._recording_failed(message))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _recording_failed(self, message):
+        self.record_btn.configure(state="normal")
+        low = message.lower()
+        if ("dshow" in low or "audio=" in low or "mikrofon" in low or "audio only device" in low):
+            use_silent = messagebox.askyesno(
+                APP_NAME + " - Mikrofon Hatası",
+                "Seçilen mikrofon FFmpeg tarafından açılamadı.\n\n"
+                + message[-650:] + "\n\n"
+                "Mikrofonsuz ekran kaydı denensin mi?",
+            )
+            if use_silent:
+                self.mic_var.set("Yok (Sessiz kayıt)")
+                # Sistem sesi de bozuk olabilir; mevcut ayarları koruyarak yeniden dene.
+                self._start_recording()
+            else:
+                self.status_label.configure(text="Mikrofonları yenileyin veya sessiz kaydı seçin.", text_color=ACCENT_DANGER)
+        else:
+            messagebox.showerror(APP_NAME, message)
+
     def _on_record_started(self, out_file):
+        self.record_btn.configure(state="normal")
         self.record_btn.configure(
             text="■ Kaydı Durdur", fg_color=ACCENT_DANGER, hover_color=ACCENT_DANGER_HOVER
         )
+        self.output_dir = out_file.parent
+        self.out_label.configure(text=str(self.output_dir))
         self.status_label.configure(text=f"Kaydediliyor → {out_file.name}", text_color="#4CD97B")
         self._tick_timer()
 
@@ -1002,6 +1130,45 @@ class ElitScreenRecorderApp(ctk.CTk):
         if self.is_recording:
             self.recorder.stop()
         self.destroy()
+
+
+def ensure_admin_on_windows():
+    """Windows UAC ile yönetici olarak yeniden çalıştırır.
+
+    Kullanıcı UAC'yi reddederse uygulama normal yetkilerle açılır; döngü olmaz.
+    """
+    if SYSTEM != "Windows":
+        return
+    import ctypes
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return
+        import subprocess as _subprocess
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            args = _subprocess.list2cmdline(sys.argv[1:])
+        else:
+            executable = sys.executable
+            args = _subprocess.list2cmdline([str(Path(__file__).resolve()), *sys.argv[1:]])
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, args, None, 1
+        )
+        if result > 32:
+            sys.exit(0)
+        # UAC reddedilirse yazılım kullanılabilir kalır.
+        from tkinter import Tk, messagebox
+        root = Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Elite Screen Recorder",
+            "Yönetici izni verilmedi. Program normal yetkilerle açılacak.",
+            parent=root,
+        )
+        root.destroy()
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 
 
 def main():
